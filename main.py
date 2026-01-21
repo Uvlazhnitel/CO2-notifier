@@ -1,13 +1,13 @@
 # ESP32-S3 + SCD41 (I2C0 GPIO8/9) + SH1106 (I2C1 GPIO13/12)
-# 3 экрана: Temperature / CO2 / Humidity
-# Normal mode (5s) для более быстрого отклика
+# 3 screens: Temperature / CO2 / Humidity
+# Normal mode (~5s) for faster response
 
 from machine import Pin, I2C
 import time
 import sh1106
 import framebuf
 
-# ----------------- Адреса / пины -----------------
+# ----------------- Addresses / pins -----------------
 SCD4X_ADDR = 0x62
 OLED_ADDR  = 0x3C
 
@@ -18,46 +18,43 @@ OLED_SCL = 12
 
 W, H = 128, 64
 
-# ----------------- Режим измерений -----------------
-# normal: обновление ~5 секунд (рекомендовано для “быстрой реакции”) :contentReference[oaicite:4]{index=4}
-# lowpower: обновление ~30 секунд :contentReference[oaicite:5]{index=5}
-MEAS_MODE = "normal"   # "normal" или "lowpower"
-READY_POLL_MS = 350    # как часто проверяем data_ready
+# ----------------- Measurement mode -----------------
+# normal: update ~5s
+# lowpower: update ~30s
+MEAS_MODE = "normal"      # "normal" or "lowpower"
+READY_POLL_MS = 350       # how often to poll data_ready
 
-# ----------------- Настройки -----------------
+# ----------------- Sensor settings -----------------
 ASC_ENABLED = True
 ALTITUDE_M = 0
 
-# ----------------- Экран -----------------
+# ----------------- Screen rotation -----------------
 SCREEN_DURATION_SEC = 5
 
-# ----------------- Фильтры -----------------
+# ----------------- Filters (EMA) -----------------
 EMA_CO2_ALPHA = 0.35
 EMA_T_ALPHA   = 0.20
 EMA_RH_ALPHA  = 0.20
 
-# ----------------- Качество воздуха -----------------
+# ----------------- CO2 quality thresholds -----------------
 CO2_GOOD_MAX = 800
 CO2_OK_MAX   = 1200
 
-# ----------------- Порог “проветрить” -----------------
+# ----------------- Ventilation trigger (hysteresis) -----------------
 VENT_ON_PPM   = 1200
 VENT_OFF_PPM  = 900
 VENT_NEED_N   = 2
 
-# ----------------- Температурный оффсет -----------------
-# Сначала попробуй поставить 3.1°C (по твоим данным).
-FORCE_TOFFSET_C = None  # None если не хочешь трогать
-PERSIST_TOFFSET = False   # True только когда убедился, что всё верно (не надо часто писать EEPROM)
+# ----------------- Temperature offset -----------------
+FORCE_TOFFSET_C = None     # set to a number (e.g. 3.1) or keep None
+PERSIST_TOFFSET = False    # True only when you are sure (EEPROM writes)
 
-# Если хочешь считать автоматически по термометру:
-# (делай после 20-30 минут стабильной работы в месте установки)
 RUN_TOFFSET_WIZARD = False
-T_REFERENCE_C = 24.6  # твой термометр рядом с датчиком
+T_REFERENCE_C = 24.6
 PERSIST_WIZARD = False
 
 
-# ----------------- Вспомогательные: CRC Sensirion -----------------
+# ----------------- Sensirion CRC helpers -----------------
 def crc8(data: bytes) -> int:
     crc = 0xFF
     for b in data:
@@ -90,7 +87,7 @@ def parse_words_with_crc(buf: bytes):
     return words
 
 
-# ----------------- Драйвер SCD41 -----------------
+# ----------------- SCD41 driver -----------------
 class SCD41:
     def __init__(self, i2c: I2C, addr=SCD4X_ADDR):
         self.i2c = i2c
@@ -108,11 +105,11 @@ class SCD41:
         time.sleep_ms(500)
 
     def start_periodic_measurement(self):
-        self._write_cmd(0x21B1)  # 5s update :contentReference[oaicite:6]{index=6}
+        self._write_cmd(0x21B1)  # ~5s update
         time.sleep_ms(5)
 
     def start_low_power_periodic_measurement(self):
-        self._write_cmd(0x21AC)  # 30s update :contentReference[oaicite:7]{index=7}
+        self._write_cmd(0x21AC)  # ~30s update
         time.sleep_ms(5)
 
     def get_data_ready_status(self) -> bool:
@@ -122,7 +119,6 @@ class SCD41:
         return (status & 0x07FF) != 0
 
     def read_measurement(self):
-        # важно: read_measurement очищает буфер, нельзя читать чаще одного апдейта :contentReference[oaicite:8]{index=8}
         self._write_cmd(0xEC05)
         time.sleep_ms(1)
         co2_raw, t_raw, rh_raw = self._read_words(3)
@@ -145,14 +141,12 @@ class SCD41:
         time.sleep_ms(800)
 
     def get_temperature_offset(self) -> float:
-        # Toffset[°C] = 175 * word / 65535 :contentReference[oaicite:9]{index=9}
         self._write_cmd(0x2318)
         time.sleep_ms(1)
         w = self._read_words(1)[0]
         return (w * 175.0) / 65535.0
 
     def set_temperature_offset(self, offset_c: float):
-        # word = Toffset * 65535 / 175 :contentReference[oaicite:10]{index=10}
         offset_c = float(offset_c)
         if offset_c < 0:
             offset_c = 0.0
@@ -163,7 +157,7 @@ class SCD41:
         time.sleep_ms(1)
 
 
-# ----------------- OLED: большой текст -----------------
+# ----------------- OLED: scaled text -----------------
 def text_scaled(oled, s, x, y, scale=3):
     bw = len(s) * 8
     bh = 8
@@ -194,7 +188,7 @@ def centered_x_for_scaled(text, scale):
     return 0 if x < 0 else x
 
 
-# ----------------- Иконки -----------------
+# ----------------- Icons -----------------
 def draw_temp_icon(oled, x, y):
     oled.rect(x+3, y, 4, 12, 1)
     oled.fill_rect(x+1, y+10, 8, 6, 1)
@@ -214,7 +208,7 @@ def draw_humidity_icon(oled, x, y):
     oled.pixel(x+5, y+10, 1)
 
 
-# ----------------- Лейблы качества -----------------
+# ----------------- Helpers -----------------
 def quality_label(ppm_int):
     if ppm_int < CO2_GOOD_MAX:
         return "GOOD"
@@ -223,25 +217,21 @@ def quality_label(ppm_int):
     else:
         return "BAD"
 
-
-# ----------------- EMA -----------------
 def ema(prev, x, alpha):
     return x if prev is None else (prev + alpha * (x - prev))
 
-
-# ----------------- Экраны -----------------
 def vent_banner(oled):
     oled.fill_rect(0, 56, 128, 8, 1)
     oled.text("VENTILATE!", 28, 57, 0)
 
-def render_co2_screen(oled, co2v, vent_flag, toffset=None):
-    oled.fill(0)
 
+# ----------------- Screens -----------------
+def render_co2_screen(oled, co2v, vent_flag):
+    oled.fill(0)
     co2_disp = int(round(float(co2v)))
     label = quality_label(co2_disp)
 
     oled.text("AIR QUALITY", 24, 0)
-
     if vent_flag:
         oled.text("!", 120, 0)
 
@@ -252,6 +242,7 @@ def render_co2_screen(oled, co2v, vent_flag, toffset=None):
     else:
         scale_num = 3
         y_num = 12
+
     x_num = centered_x_for_scaled(co2_str, scale_num)
     text_scaled(oled, co2_str, x_num, y_num, scale=scale_num)
 
@@ -263,27 +254,24 @@ def render_co2_screen(oled, co2v, vent_flag, toffset=None):
 
     oled.show()
 
-def render_temp_screen(oled, tv, vent_flag, toffset=None):
+def render_temp_screen(oled, tv, vent_flag):
     oled.fill(0)
     draw_temp_icon(oled, 4, 2)
     oled.text("TEMPERATURE", 20, 2)
 
-    # --- формат температуры с 1 знаком после запятой ---
     t = float(tv)
     sign = "-" if t < 0 else ""
     t = abs(t)
 
     t_int = int(t)
     t_dec = int(round((t - t_int) * 10))
-    if t_dec == 10:  # корректировка из-за округления
+    if t_dec == 10:
         t_int += 1
         t_dec = 0
 
-    big = sign + str(t_int)      # крупно: "24"
-    dec = ".%d" % t_dec          # мелко: ".6"
+    big = sign + str(t_int)
+    dec = ".%d" % t_dec
 
-    # Подбираем масштаб, чтобы влезало
-    # (2 цифры -> крупнее, 3 цифры -> чуть меньше)
     if len(big) <= 2:
         scale_big = 4
     elif len(big) == 3:
@@ -293,14 +281,12 @@ def render_temp_screen(oled, tv, vent_flag, toffset=None):
 
     scale_dec = 2
 
-    # Центрируем блок "big + dec"
     big_w = len(big) * 8 * scale_big
     dec_w = len(dec) * 8 * scale_dec
     total_w = big_w + dec_w + 2
     x0 = (W - total_w) // 2
 
     y_big = 20
-    # десятые выравниваем по нижнему краю крупного числа
     y_dec = y_big + (scale_big*8 - scale_dec*8)
 
     text_scaled(oled, big, x0, y_big, scale=scale_big)
@@ -313,11 +299,11 @@ def render_temp_screen(oled, tv, vent_flag, toffset=None):
 
     oled.show()
 
-
-def render_hum_screen(oled, rhv, vent_flag, toffset=None):
+def render_hum_screen(oled, rhv, vent_flag):
     oled.fill(0)
     draw_humidity_icon(oled, 4, 2)
     oled.text("HUMIDITY", 22, 2)
+
     rh_str = "{:.0f}".format(rhv)
     text_scaled(oled, rh_str, 28, 20, scale=5)
     oled.text("%", 112, 35)
@@ -327,18 +313,17 @@ def render_hum_screen(oled, rhv, vent_flag, toffset=None):
 
     oled.show()
 
-def render_screen(oled, screen, co2v, tv, rhv, vent_flag, toffset=None):
+def render_screen(oled, screen, co2v, tv, rhv, vent_flag):
     if screen == 0:
-        render_temp_screen(oled, tv, vent_flag, toffset=toffset)
+        render_temp_screen(oled, tv, vent_flag)
     elif screen == 1:
-        render_co2_screen(oled, co2v, vent_flag, toffset=toffset)
+        render_co2_screen(oled, co2v, vent_flag)
     else:
-        render_hum_screen(oled, rhv, vent_flag, toffset=toffset)
+        render_hum_screen(oled, rhv, vent_flag)
 
 
-# ----------------- MAIN -----------------
+# ----------------- Main -----------------
 def main():
-    # I2C
     i2c_scd  = I2C(0, sda=Pin(SCD_SDA),  scl=Pin(SCD_SCL),  freq=100_000)
     i2c_oled = I2C(1, sda=Pin(OLED_SDA), scl=Pin(OLED_SCL), freq=400_000)
 
@@ -347,7 +332,6 @@ def main():
     print("I2C0 scan (SCD): ", [hex(a) for a in scd_scan])
     print("I2C1 scan (OLED):", [hex(a) for a in oled_scan])
 
-    # OLED
     oled = sh1106.SH1106_I2C(W, H, i2c_oled, addr=OLED_ADDR)
     oled.sleep(False)
     oled.fill(0)
@@ -362,7 +346,6 @@ def main():
 
     scd = SCD41(i2c_scd)
 
-    # Настройки датчика — только в idle
     try:
         scd.stop_periodic_measurement()
     except:
@@ -371,7 +354,6 @@ def main():
     scd.set_asc_enabled(ASC_ENABLED)
     scd.set_sensor_altitude(ALTITUDE_M)
 
-    # Читаем текущий Toffset
     toffset = None
     try:
         toffset = scd.get_temperature_offset()
@@ -379,7 +361,6 @@ def main():
     except Exception as e:
         print("Toffset read error:", e)
 
-    # Принудительно поставить Toffset (твоя ситуация — рекомендуется 3.1)
     if FORCE_TOFFSET_C is not None:
         scd.set_temperature_offset(FORCE_TOFFSET_C)
         time.sleep_ms(10)
@@ -392,9 +373,7 @@ def main():
             scd.persist_settings()
             print("Toffset persisted.")
 
-    # Wizard по термометру (делать после прогрева в месте установки!)
     if RUN_TOFFSET_WIZARD:
-        # запускаем normal, получаем свежий Tscd
         scd.start_periodic_measurement()
         print("Wizard: waiting fresh sample...")
         while not scd.get_data_ready_status():
@@ -402,10 +381,11 @@ def main():
         _, t_scd, _ = scd.read_measurement()
 
         prev = toffset if toffset is not None else 4.0
-        # Toffset_actual = Tscd - Tref + Toffset_previous :contentReference[oaicite:11]{index=11}
         new_off = (t_scd - T_REFERENCE_C) + prev
-        if new_off < 0: new_off = 0.0
-        if new_off > 20: new_off = 20.0
+        if new_off < 0:
+            new_off = 0.0
+        if new_off > 20:
+            new_off = 20.0
 
         scd.stop_periodic_measurement()
         scd.set_temperature_offset(new_off)
@@ -416,15 +396,13 @@ def main():
             scd.persist_settings()
             print("Wizard Toffset persisted.")
 
-    # Старт измерений
     if MEAS_MODE == "lowpower":
         scd.start_low_power_periodic_measurement()
         print("Mode: LOW POWER (~30s)")
     else:
         scd.start_periodic_measurement()
-        print("Mode: NORMAL (5s)")
+        print("Mode: NORMAL (~5s)")
 
-    # Состояния
     screen = 0
     last_switch = time.ticks_ms()
     last_ready_poll = time.ticks_ms()
@@ -435,24 +413,19 @@ def main():
 
     vent_needed = False
     vent_counter = 0
-
-    # чтобы не дёргать на первом измерении
     have_sample = False
 
-    # Первичный экран
-    render_screen(oled, screen, 400, 0.0, 0.0, False, toffset=toffset)
+    render_screen(oled, screen, 400, 0.0, 0.0, False)
 
     while True:
         now = time.ticks_ms()
         redraw = False
 
-        # смена экрана
         if time.ticks_diff(now, last_switch) >= SCREEN_DURATION_SEC * 1000:
             screen = (screen + 1) % 3
             last_switch = now
             redraw = True
 
-        # опрос готовности
         if time.ticks_diff(now, last_ready_poll) >= READY_POLL_MS:
             last_ready_poll = now
 
@@ -464,7 +437,6 @@ def main():
                 t_f   = ema(t_f,   temp, EMA_T_ALPHA)
                 rh_f  = ema(rh_f,  rh,  EMA_RH_ALPHA)
 
-                # логика “проветрить” по сглаженному CO2
                 co2_logic = co2_f if co2_f is not None else co2
 
                 if co2_logic >= VENT_ON_PPM:
@@ -487,11 +459,9 @@ def main():
                 co2_f if co2_f is not None else co2,
                 t_f   if t_f   is not None else temp,
                 rh_f  if rh_f  is not None else rh,
-                vent_needed,
-                toffset=toffset
+                vent_needed
             )
 
         time.sleep_ms(20)
-
 
 main()
