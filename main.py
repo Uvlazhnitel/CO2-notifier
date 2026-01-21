@@ -47,7 +47,7 @@ VENT_NEED_N   = 2
 
 # ----------------- Температурный оффсет -----------------
 # Сначала попробуй поставить 3.1°C (по твоим данным).
-FORCE_TOFFSET_C = 3.1     # None если не хочешь трогать
+FORCE_TOFFSET_C = None  # None если не хочешь трогать
 PERSIST_TOFFSET = False   # True только когда убедился, что всё верно (не надо часто писать EEPROM)
 
 # Если хочешь считать автоматически по термометру:
@@ -241,9 +241,6 @@ def render_co2_screen(oled, co2v, vent_flag, toffset=None):
     label = quality_label(co2_disp)
 
     oled.text("AIR QUALITY", 24, 0)
-    if toffset is not None:
-        # маленький индикатор Toffset справа
-        oled.text("{:.1f}".format(toffset), 100, 0)
 
     if vent_flag:
         oled.text("!", 120, 0)
@@ -270,25 +267,57 @@ def render_temp_screen(oled, tv, vent_flag, toffset=None):
     oled.fill(0)
     draw_temp_icon(oled, 4, 2)
     oled.text("TEMPERATURE", 20, 2)
-    if toffset is not None:
-        oled.text("Tof", 104, 2)
 
-    temp_str = "{:.0f}".format(tv)
-    text_scaled(oled, temp_str, 25, 20, scale=5)
-    oled.text("C", 112, 35)
+    # --- формат температуры с 1 знаком после запятой ---
+    t = float(tv)
+    sign = "-" if t < 0 else ""
+    t = abs(t)
+
+    t_int = int(t)
+    t_dec = int(round((t - t_int) * 10))
+    if t_dec == 10:  # корректировка из-за округления
+        t_int += 1
+        t_dec = 0
+
+    big = sign + str(t_int)      # крупно: "24"
+    dec = ".%d" % t_dec          # мелко: ".6"
+
+    # Подбираем масштаб, чтобы влезало
+    # (2 цифры -> крупнее, 3 цифры -> чуть меньше)
+    if len(big) <= 2:
+        scale_big = 4
+    elif len(big) == 3:
+        scale_big = 3
+    else:
+        scale_big = 2
+
+    scale_dec = 2
+
+    # Центрируем блок "big + dec"
+    big_w = len(big) * 8 * scale_big
+    dec_w = len(dec) * 8 * scale_dec
+    total_w = big_w + dec_w + 2
+    x0 = (W - total_w) // 2
+
+    y_big = 20
+    # десятые выравниваем по нижнему краю крупного числа
+    y_dec = y_big + (scale_big*8 - scale_dec*8)
+
+    text_scaled(oled, big, x0, y_big, scale=scale_big)
+    text_scaled(oled, dec, x0 + big_w + 2, y_dec, scale=scale_dec)
+
+    oled.text("C", 120, 35)
 
     if vent_flag:
         vent_banner(oled)
 
     oled.show()
 
+
 def render_hum_screen(oled, rhv, vent_flag, toffset=None):
     oled.fill(0)
     draw_humidity_icon(oled, 4, 2)
     oled.text("HUMIDITY", 22, 2)
-    if toffset is not None:
-        oled.text("Tof", 104, 2)
-
     rh_str = "{:.0f}".format(rhv)
     text_scaled(oled, rh_str, 28, 20, scale=5)
     oled.text("%", 112, 35)
