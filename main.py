@@ -1,31 +1,37 @@
 # ESP32-S3 + SCD41 (I2C0 GPIO8/9) + SH1106 (I2C1 GPIO13/12)
 # 3 screens: Temperature / CO2 / Humidity
 # + Telegram notify when "vent_needed" turns ON
-        
+
+
+
 from machine import Pin, I2C
 import time
-import sh1106
-import framebuf
 import network
+import framebuf
+import sh1106
 
 try:
     import urequests as requests
 except ImportError:
     raise ImportError("urequests not found. Upload urequests.py to the board.")
 
-# ---------------- Wi-Fi / Telegram ----------------
+# ---------------- USER SETTINGS ----------------
 WIFI_SSID = ""
 WIFI_PASS = ""
 
 TG_TOKEN  = ""  
-TG_CHAT_ID = 417523636    
+TG_CHAT_ID = ""   
 
-TG_SEND_STATUS_ON_BOOT = True
+SEND_BOOT_MSG = True
 
-# For testing: keep it small (e.g. 5-10s). For real use: 30*60*1000
-TG_COOLDOWN_MS = 10 * 1000
+# Telegram pacing
+TG_MIN_GAP_MS = 1500            # minimal gap between any sends (safety)
+TG_REMIND_MS  = 20 * 60 * 1000   # remind while still >= WARN (set small for testing, e.g. 15000)
 
-# ---------------- Display / sensor pins ----------------
+# Wi-Fi watchdog
+WIFI_RECONNECT_MS = 10_000
+
+# ---------------- PINS / ADDRESSES ----------------
 SCD4X_ADDR = 0x62
 OLED_ADDR  = 0x3C
 
@@ -36,39 +42,47 @@ OLED_SCL = 12
 
 W, H = 128, 64
 
-# ---------------- Measurement ----------------
-MEAS_MODE = "normal"      # "normal" (~5s) or "lowpower" (~30s)
-READY_POLL_MS = 350
+# ---------------- SENSOR MODE ----------------
+MEAS_MODE      = "normal"   # "normal" (~5s) or "lowpower" (~30s)
+READY_POLL_MS  = 350
 
 ASC_ENABLED = True
 ALTITUDE_M = 0
 
-# ---------------- UI ----------------
+# ---------------- SCREEN ROTATION ----------------
 SCREEN_DURATION_SEC = 5
 
-# ---------------- Filters ----------------
-EMA_CO2_ALPHA = 1.0   # for testing: 1.0 = no smoothing
+# ---------------- FILTERS ----------------
+EMA_CO2_ALPHA = 0.35
 EMA_T_ALPHA   = 0.20
 EMA_RH_ALPHA  = 0.20
 
-# ---------------- CO2 thresholds ----------------
-CO2_GOOD_MAX = 800
-CO2_OK_MAX   = 1200
+# ---------------- CO2 LEVELS (HYSTERESIS) ----------------
+# Level 0: OK
+# Level 1: WARN (productivity threshold)
+# Level 2: HIGH
+# Level 3: RED (unacceptable)
+WARN_ON  = 1000
+WARN_OFF = 850
 
-VENT_ON_PPM  = 1200
-VENT_OFF_PPM = 900
-VENT_NEED_N  = 1      # for testing: 1 sample is enough
+HIGH_ON  = 1400
+HIGH_OFF = 1200
 
-# ---------------- Test switches ----------------
-TEST_SIMPLE_THRESHOLD = True           # vent_needed = (co2 >= VENT_ON_PPM)
-TEST_NOTIFY_ALWAYS_WHEN_HIGH = True    # send repeatedly while high (cooldown-limited)
+RED_ON   = 2000
+RED_OFF  = 1800
 
-# ---------------- Optional temperature offset ----------------
+# Optional temperature offset
 FORCE_TOFFSET_C = None
 PERSIST_TOFFSET = False
 
 
-# --------- Small helpers ---------
+# ---------------- SMALL HELPERS ----------------
+def ema(prev, x, alpha):
+    return x if prev is None else (prev + alpha * (x - prev))
+
+def level_name(lvl: int) -> str:
+    return ["OK", "WARN", "HIGH", "RED"][lvl]
+
 def url_escape(s: str) -> str:
     out = []
     for b in s.encode("utf-8"):
@@ -80,6 +94,8 @@ def url_escape(s: str) -> str:
             out.append("%{:02X}".format(b))
     return "".join(out)
 
+
+# ---------------- WIFI ----------------
 def wifi_connect(timeout_ms=15000):
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
@@ -94,34 +110,57 @@ def wifi_connect(timeout_ms=15000):
         time.sleep_ms(200)
     return wlan
 
+
+# ---------------- OPTIONAL: NTP TIME (helps some HTTPS/TLS setups) ----------------
+def sync_time_ntp():
+    try:
+        import ntptime
+        ntptime.settime()  # sets UTC
+        print("NTP time synced")
+    except Exception as e:
+        print("NTP sync skipped/error:", e)
+
+
+# ---------------- TELEGRAM ----------------
+_last_tg_send = 0
+
 def tg_send(text: str) -> bool:
+    global _last_tg_send
+
     if not TG_TOKEN or TG_TOKEN == "YOUR_BOT_TOKEN":
-        print("Telegram token not set")
+        print("TG: token not set")
         return False
 
+    # simple anti-spam gap
+    now = time.ticks_ms()
+    if time.ticks_diff(now, _last_tg_send) < TG_MIN_GAP_MS:
+        return False
+
+    # GET is the most compatible in MicroPython
     url = "https://api.telegram.org/bot{}/sendMessage?chat_id={}&text={}".format(
         TG_TOKEN, TG_CHAT_ID, url_escape(text)
     )
+
     try:
         r = requests.get(url)
+        code = getattr(r, "status_code", None)
+        body = getattr(r, "text", "")
         r.close()
+
+        print("TG HTTP:", code)
+        if code is not None and code != 200:
+            print("TG body:", body[:200])
+            return False
+
+        _last_tg_send = now
         return True
+
     except Exception as e:
-        print("TG send error:", e)
+        print("TG send exception:", e)
         return False
 
-def ema(prev, x, alpha):
-    return x if prev is None else (prev + alpha * (x - prev))
 
-def quality_label(ppm: int) -> str:
-    if ppm < CO2_GOOD_MAX:
-        return "GOOD"
-    if ppm < CO2_OK_MAX:
-        return "OK"
-    return "BAD"
-
-
-# --------- Sensirion CRC ---------
+# ---------------- SENSIRION CRC ----------------
 def crc8(data: bytes) -> int:
     crc = 0xFF
     for b in data:
@@ -154,9 +193,9 @@ def parse_words_with_crc(buf: bytes):
     return words
 
 
-# --------- SCD41 driver ---------
+# ---------------- SCD41 DRIVER ----------------
 class SCD41:
-    def __init__(self, i2c: I2C, addr=SCD4X_ADDR):
+    def __init__(self, i2c, addr=SCD4X_ADDR):
         self.i2c = i2c
         self.addr = addr
 
@@ -172,11 +211,11 @@ class SCD41:
         time.sleep_ms(500)
 
     def start_periodic_measurement(self):
-        self._write_cmd(0x21B1)
+        self._write_cmd(0x21B1)  # ~5s
         time.sleep_ms(5)
 
     def start_low_power_periodic_measurement(self):
-        self._write_cmd(0x21AC)
+        self._write_cmd(0x21AC)  # ~30s
         time.sleep_ms(5)
 
     def get_data_ready_status(self) -> bool:
@@ -218,7 +257,7 @@ class SCD41:
         time.sleep_ms(1)
 
 
-# --------- OLED helpers ---------
+# ---------------- OLED DRAW ----------------
 def text_scaled(oled, s, x, y, scale=3):
     bw = len(s) * 8
     bh = 8
@@ -265,102 +304,128 @@ def draw_humidity_icon(oled, x, y):
     oled.pixel(x+3, y+10, 1)
     oled.pixel(x+5, y+10, 1)
 
-def vent_banner(oled):
+def banner(oled, lvl):
     oled.fill_rect(0, 56, 128, 8, 1)
-    oled.text("VENTILATE!", 28, 57, 0)
+    oled.text(level_name(lvl), 54, 57, 0)
 
-
-# --------- Screens ---------
-def render_co2_screen(oled, co2v, vent_flag):
+def render_co2(oled, co2v, lvl):
     oled.fill(0)
-    co2_disp = int(round(float(co2v)))
-    label = quality_label(co2_disp)
+    co2i = int(round(co2v))
+    lbl = level_name(lvl)
 
-    oled.text("AIR QUALITY", 24, 0)
-    if vent_flag:
+    oled.text("CO2", 56, 0)
+    if lvl >= 1:
         oled.text("!", 120, 0)
 
-    co2_str = str(co2_disp)
-    scale_num = 4 if len(co2_str) <= 3 else 3
-    y_num = 10 if len(co2_str) <= 3 else 12
-    x_num = centered_x_for_scaled(co2_str, scale_num)
-    text_scaled(oled, co2_str, x_num, y_num, scale=scale_num)
+    s = str(co2i)
+    sc = 4 if len(s) <= 3 else 3
+    y  = 10 if len(s) <= 3 else 12
+    x  = centered_x_for_scaled(s, sc)
+    text_scaled(oled, s, x, y, sc)
 
     oled.text("ppm", 52, 44)
 
-    scale_lbl = 2
-    x_lbl = centered_x_for_scaled(label, scale_lbl)
-    text_scaled(oled, label, x_lbl, 46, scale=scale_lbl)
+    sc2 = 2
+    x2 = centered_x_for_scaled(lbl, sc2)
+    text_scaled(oled, lbl, x2, 46, sc2)
 
+    if lvl >= 1:
+        banner(oled, lvl)
     oled.show()
 
-def render_temp_screen(oled, tv, vent_flag):
+def render_temp(oled, tv, lvl):
     oled.fill(0)
     draw_temp_icon(oled, 4, 2)
-    oled.text("TEMPERATURE", 20, 2)
+    oled.text("TEMP", 56, 2)
 
     t = float(tv)
     sign = "-" if t < 0 else ""
     t = abs(t)
-    t_int = int(t)
-    t_dec = int(round((t - t_int) * 10))
-    if t_dec == 10:
-        t_int += 1
-        t_dec = 0
+    ti = int(t)
+    td = int(round((t - ti) * 10))
+    if td == 10:
+        ti += 1
+        td = 0
 
-    big = sign + str(t_int)
-    dec = ".%d" % t_dec
+    big = sign + str(ti)
+    dec = ".%d" % td
 
-    if len(big) <= 2:
-        scale_big = 4
-    elif len(big) == 3:
-        scale_big = 3
-    else:
-        scale_big = 2
-    scale_dec = 2
+    sb = 4 if len(big) <= 2 else (3 if len(big) == 3 else 2)
+    sd = 2
 
-    big_w = len(big) * 8 * scale_big
-    dec_w = len(dec) * 8 * scale_dec
-    total_w = big_w + dec_w + 2
-    x0 = (W - total_w) // 2
+    bw = len(big) * 8 * sb
+    dw = len(dec) * 8 * sd
+    x0 = (W - (bw + dw + 2)) // 2
+    yb = 20
+    yd = yb + (sb*8 - sd*8)
 
-    y_big = 20
-    y_dec = y_big + (scale_big*8 - scale_dec*8)
-
-    text_scaled(oled, big, x0, y_big, scale=scale_big)
-    text_scaled(oled, dec, x0 + big_w + 2, y_dec, scale=scale_dec)
+    text_scaled(oled, big, x0, yb, sb)
+    text_scaled(oled, dec, x0 + bw + 2, yd, sd)
 
     oled.text("C", 120, 35)
-    if vent_flag:
-        vent_banner(oled)
+    if lvl >= 1:
+        banner(oled, lvl)
     oled.show()
 
-def render_hum_screen(oled, rhv, vent_flag):
+def render_hum(oled, rh, lvl):
     oled.fill(0)
     draw_humidity_icon(oled, 4, 2)
-    oled.text("HUMIDITY", 22, 2)
+    oled.text("HUM", 58, 2)
 
-    rh_str = "{:.0f}".format(rhv)
-    text_scaled(oled, rh_str, 28, 20, scale=5)
+    s = "{:.0f}".format(rh)
+    text_scaled(oled, s, 28, 20, 5)
     oled.text("%", 112, 35)
 
-    if vent_flag:
-        vent_banner(oled)
+    if lvl >= 1:
+        banner(oled, lvl)
     oled.show()
 
-def render_screen(oled, screen, co2v, tv, rhv, vent_flag):
+def render_screen(oled, screen, co2v, tv, rhv, lvl):
     if screen == 0:
-        render_temp_screen(oled, tv, vent_flag)
+        render_temp(oled, tv, lvl)
     elif screen == 1:
-        render_co2_screen(oled, co2v, vent_flag)
+        render_co2(oled, co2v, lvl)
     else:
-        render_hum_screen(oled, rhv, vent_flag)
+        render_hum(oled, rhv, lvl)
 
 
-# --------- Main ---------
+# ---------------- CO2 LEVEL FSM ----------------
+def update_level(prev, co2):
+    # OK -> WARN -> HIGH -> RED with hysteresis
+    if prev == 0:
+        if co2 >= RED_ON:  return 3
+        if co2 >= HIGH_ON: return 2
+        if co2 >= WARN_ON: return 1
+        return 0
+
+    if prev == 1:
+        if co2 >= RED_ON:  return 3
+        if co2 >= HIGH_ON: return 2
+        if co2 <= WARN_OFF: return 0
+        return 1
+
+    if prev == 2:
+        if co2 >= RED_ON:  return 3
+        if co2 <= HIGH_OFF:
+            return 1 if co2 >= WARN_ON else 0
+        return 2
+
+    # prev == 3
+    if co2 <= RED_OFF:
+        if co2 >= HIGH_ON: return 2
+        if co2 >= WARN_ON: return 1
+        return 0
+    return 3
+
+
+# ---------------- MAIN ----------------
 def main():
     wlan = wifi_connect()
-    print("Wi-Fi:", wlan.isconnected(), wlan.ifconfig() if wlan.isconnected() else None)
+    print("Wi-Fi connected:", wlan.isconnected(), wlan.ifconfig() if wlan.isconnected() else None)
+
+    # optional NTP (doesn't hurt)
+    if wlan.isconnected():
+        sync_time_ntp()
 
     i2c_scd  = I2C(0, sda=Pin(SCD_SDA),  scl=Pin(SCD_SCL),  freq=100_000)
     i2c_oled = I2C(1, sda=Pin(OLED_SDA), scl=Pin(OLED_SCL), freq=400_000)
@@ -397,90 +462,84 @@ def main():
     else:
         scd.start_periodic_measurement()
 
+    # Telegram quick self-test
+    if SEND_BOOT_MSG and wlan.isconnected():
+        ok = tg_send("CO2 monitor booted ✅")
+        print("TG boot send:", ok)
+
     screen = 0
     last_switch = time.ticks_ms()
-    last_ready_poll = time.ticks_ms()
-    last_wifi_check = time.ticks_ms()
+    last_ready  = time.ticks_ms()
+    last_wifi   = time.ticks_ms()
 
     co2_f = None
     t_f   = None
     rh_f  = None
 
-    vent_needed = False
-    vent_counter = 0
+    lvl = 0
+    last_remind = time.ticks_add(time.ticks_ms(), -TG_REMIND_MS)
 
     have_sample = False
-    last_notify = time.ticks_add(time.ticks_ms(), -TG_COOLDOWN_MS)
-
-    if TG_SEND_STATUS_ON_BOOT and wlan.isconnected():
-        tg_send("CO2 monitor booted ✅")
-
-    render_screen(oled, screen, 400, 0.0, 0.0, False)
+    render_screen(oled, screen, 400.0, 0.0, 0.0, lvl)
 
     while True:
         now = time.ticks_ms()
-        redraw = False
 
-        if time.ticks_diff(now, last_wifi_check) > 10000:
-            last_wifi_check = now
+        # Wi-Fi watchdog
+        if time.ticks_diff(now, last_wifi) > WIFI_RECONNECT_MS:
+            last_wifi = now
             if not wlan.isconnected():
+                print("Wi-Fi reconnect...")
                 wlan = wifi_connect()
 
+        # Rotate screen
         if time.ticks_diff(now, last_switch) >= SCREEN_DURATION_SEC * 1000:
             screen = (screen + 1) % 3
             last_switch = now
-            redraw = True
+            if have_sample:
+                render_screen(oled, screen, co2_f, t_f, rh_f, lvl)
 
-        if time.ticks_diff(now, last_ready_poll) >= READY_POLL_MS:
-            last_ready_poll = now
+        # Sensor poll
+        if time.ticks_diff(now, last_ready) >= READY_POLL_MS:
+            last_ready = now
 
             if scd.get_data_ready_status():
                 co2, temp, rh = scd.read_measurement()
-                print("CO2:%d ppm  T:%.2f C  RH:%.2f%%" % (co2, temp, rh))
 
                 co2_f = ema(co2_f, co2, EMA_CO2_ALPHA)
                 t_f   = ema(t_f,   temp, EMA_T_ALPHA)
                 rh_f  = ema(rh_f,  rh,  EMA_RH_ALPHA)
 
-                co2_logic = co2_f if co2_f is not None else co2
-
-                # Vent logic
-                if TEST_SIMPLE_THRESHOLD:
-                    vent_needed = (co2_logic >= VENT_ON_PPM)
-                else:
-                    if co2_logic >= VENT_ON_PPM:
-                        vent_counter += 1
-                        if vent_counter >= VENT_NEED_N:
-                            vent_needed = True
-                    elif co2_logic <= VENT_OFF_PPM:
-                        vent_needed = False
-                        vent_counter = 0
-                    else:
-                        vent_counter = 0
+                prev_lvl = lvl
+                lvl = update_level(lvl, co2_f)
 
                 have_sample = True
-                redraw = True
+                render_screen(oled, screen, co2_f, t_f, rh_f, lvl)
 
-                # Test notification: send repeatedly while high
-                if TEST_NOTIFY_ALWAYS_WHEN_HIGH and vent_needed:
-                    if wlan.isconnected() and time.ticks_diff(now, last_notify) > TG_COOLDOWN_MS:
-                        msg = "VENT TEST 🌬️  CO2: {} ppm  T: {:.1f}C  RH: {:.1f}%".format(
-                            int(round(co2_logic)),
-                            float(t_f if t_f is not None else temp),
-                            float(rh_f if rh_f is not None else rh),
-                        )
-                        if tg_send(msg):
-                            last_notify = now
+                print("CO2:%d ppm  T:%.2f C  RH:%.2f%%  LVL:%s" %
+                      (int(co2_f), t_f, rh_f, level_name(lvl)))
 
-        if redraw and have_sample:
-            render_screen(
-                oled,
-                screen,
-                co2_f if co2_f is not None else 400,
-                t_f   if t_f   is not None else 0.0,
-                rh_f  if rh_f  is not None else 0.0,
-                vent_needed
-            )
+                # Notify on upward transitions
+                if wlan.isconnected() and lvl > prev_lvl and lvl >= 1:
+                    msg = "Ventilate 🌬️ ({})\nCO2: {} ppm\nT: {:.1f} C\nRH: {:.1f} %".format(
+                        level_name(lvl),
+                        int(round(co2_f)),
+                        float(t_f),
+                        float(rh_f),
+                    )
+                    tg_send(msg)
+                    last_remind = now
+
+                # Reminders while still >= WARN
+                if wlan.isconnected() and lvl >= 1 and time.ticks_diff(now, last_remind) > TG_REMIND_MS:
+                    msg = "Reminder 🌬️ ({})\nCO2: {} ppm\nT: {:.1f} C\nRH: {:.1f} %".format(
+                        level_name(lvl),
+                        int(round(co2_f)),
+                        float(t_f),
+                        float(rh_f),
+                    )
+                    if tg_send(msg):
+                        last_remind = now
 
         time.sleep_ms(20)
 
